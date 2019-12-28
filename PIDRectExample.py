@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-#----------------------------------------------------------------------------
-# Copyright (c) 2019 FIRST. All Rights Reserved.
+# ----------------------------------------------------------------------------
+# Copyright (c) 2018 FIRST. All Rights Reserved.
 # Open Source Software - may be modified and shared by FRC teams. The code
 # must be accompanied by the FIRST BSD license file in the root directory of
 # the project.
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 import json
 import time
 import sys
+import threading
 
 from cscore import CameraServer, VideoSource, UsbCamera, MjpegServer
-from networktables import NetworkTablesInstance
+from networktables import NetworkTablesInstance, NetworkTables
 import ntcore
-import numpy as np
-import cv2
 
-sys.path.append("/usr/local/lib")
-import pyrealsense2 as rs
+import cv2
+import numpy as np
+import math
+from enum import Enum
 
 #   JSON format:
 #   {
@@ -62,7 +63,9 @@ import pyrealsense2 as rs
 
 configFile = "/boot/frc.json"
 
+
 class CameraConfig: pass
+
 
 team = None
 server = False
@@ -70,9 +73,11 @@ cameraConfigs = []
 switchedCameraConfigs = []
 cameras = []
 
+
 def parseError(str):
     """Report parse error."""
     print("config error in '" + configFile + "': " + str, file=sys.stderr)
+
 
 def readCameraConfig(config):
     """Read single camera configuration."""
@@ -100,6 +105,7 @@ def readCameraConfig(config):
     cameraConfigs.append(cam)
     return True
 
+
 def readSwitchedCameraConfig(config):
     """Read single switched camera configuration."""
     cam = CameraConfig()
@@ -120,6 +126,7 @@ def readSwitchedCameraConfig(config):
 
     switchedCameraConfigs.append(cam)
     return True
+
 
 def readConfig():
     """Read configuration file."""
@@ -174,6 +181,7 @@ def readConfig():
 
     return True
 
+
 def startCamera(config):
     """Start running the camera."""
     print("Starting camera '{}' on {}".format(config.name, config.path))
@@ -189,6 +197,7 @@ def startCamera(config):
 
     return camera
 
+
 def startSwitchedCamera(config):
     """Start running the switched camera."""
     print("Starting switched camera '{}' on {}".format(config.name, config.key))
@@ -198,7 +207,7 @@ def startSwitchedCamera(config):
         if isinstance(value, float):
             i = int(value)
             if i >= 0 and i < len(cameras):
-              server.setSource(cameras[i])
+                server.setSource(cameras[i])
         elif isinstance(value, str):
             for i in range(len(cameraConfigs)):
                 if value == cameraConfigs[i].name:
@@ -218,6 +227,17 @@ if __name__ == "__main__":
     if len(sys.argv) >= 2:
         configFile = sys.argv[1]
 
+    cond = threading.Condition()
+    notified = [False]
+
+
+    def connectionListener(connected, info):
+        print(info, '; Connected=%s' % connected)
+        with cond:
+            notified[0] = True
+            cond.notify()
+
+
     # read configuration
     if not readConfig():
         sys.exit(1)
@@ -230,45 +250,69 @@ if __name__ == "__main__":
     else:
         print("Setting up NetworkTables client for team {}".format(team))
         ntinst.startClientTeam(team)
-        # Replace with specific IP Address if not on roboRIO-like network
-        # ntinst.startClient("<IP ADDRESS>")
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    NetworkTables.addConnectionListener(connectionListener, immediateNotify=True)
 
-    profile = pipeline.start(config)
+    with cond:
+        print("Waiting for network tables connection...")
+        if not notified[0]:
+            ret = cond.wait()
+            # I've noticed that this wait is kind of dangerous on a spotty network connection.
+            # May need to have timeout condition.
+            # ret = cond.wait(10)
+            # print(f"Wait returned: {ret}")
 
-    device = profile.get_device()
-    print(f"Device: {device}")
-    # print(f"Device: {device.__dir__()}")
+    # start cameras
+    for config in cameraConfigs:
+        cameras.append(startCamera(config))
 
-    try:
-        print("Getting OutputStream...")
-        colorOutputStream = CameraServer.getInstance().putVideo("Color Image", 640, 480)
-        depthOutputStream = CameraServer.getInstance().putVideo("Depth Image", 640, 480)
+    # start switched cameras
+    for config in switchedCameraConfigs:
+        startSwitchedCamera(config)
 
+    table = ntinst.getTable("datatable")
+    xEntry = table.getEntry("X")
+    yEntry = table.getEntry("Y")
+
+    if cameras:
+        camera = cameras[0]
+        camera_config = next(cc for cc in cameraConfigs if cc.name == camera.getName())
+
+        width = camera_config.config['width']
+        height = camera_config.config['height']
+
+        cvSink = CameraServer.getInstance().getVideo()
+        outputStream = CameraServer.getInstance().putVideo("Contours", width, height)
+
+        source = np.ndarray(shape=(width, height, 3))
+
+        rect_height = 20
+        rect_width = 20
+        x_amplitude = width * 0.5
+        y = int((height * 0.5) - (rect_height * 0.5))
+
+        frequency = 1 / 10  # Oscillate back and forth every 10 seconds
+
+        start_time = time.time()
+
+        # loop forever doing awesome vision stuffs
         while True:
-            frames = pipeline.wait_for_frames()
-            depth_frame = frames.get_depth_frame()
-            color_frame = frames.get_color_frame()
+            ret, source = cvSink.grabFrame(source)
+            if ret:
+                now = time.time()
+                x = int(x_amplitude *
+                        math.sin(2 * math.pi * frequency * (now - start_time)) + (width * 0.5) - (rect_width * 0.5))
+                source = cv2.rectangle(source, (x, y), (x + rect_width, y + rect_height), (204, 237, 88), 1)
 
-            if not depth_frame or not color_frame:
-                print("No frames found!!!")
-                continue
+                center_x = x + rect_width * 0.5
+                center_y = y + rect_height * 0.5
 
-            depth_image = np.asanyarray(depth_frame.get_data())
-            color_image = np.asanyarray(color_frame.get_data())
+                print(f"CenterX: {center_x}, CenterY: {center_y}")
 
-            depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
+                xEntry.setNumber(center_x)
+                yEntry.setNumber(center_y)
 
-            colorOutputStream.putFrame(color_image)
-            depthOutputStream.putFrame(depth_colormap)
+            outputStream.putFrame(source)
 
-    finally:
-        print("Calling pipeline stop")
-        pipeline.stop()
-
-        # Sometimes the system won't come back up without a complete hardware reset.
-        device.hardware_reset()
+    else:
+        print("Bummer. No cameras...")

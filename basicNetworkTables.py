@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #----------------------------------------------------------------------------
-# Copyright (c) 2019 FIRST. All Rights Reserved.
+# Copyright (c) 2018 FIRST. All Rights Reserved.
 # Open Source Software - may be modified and shared by FRC teams. The code
 # must be accompanied by the FIRST BSD license file in the root directory of
 # the project.
@@ -9,15 +9,17 @@
 import json
 import time
 import sys
+import threading
 
 from cscore import CameraServer, VideoSource, UsbCamera, MjpegServer
-from networktables import NetworkTablesInstance
+from networktables import NetworkTablesInstance, NetworkTables
 import ntcore
-import numpy as np
-import cv2
 
-sys.path.append("/usr/local/lib")
-import pyrealsense2 as rs
+import cv2
+import numpy as np
+import math
+from enum import Enum
+
 
 #   JSON format:
 #   {
@@ -174,49 +176,19 @@ def readConfig():
 
     return True
 
-def startCamera(config):
-    """Start running the camera."""
-    print("Starting camera '{}' on {}".format(config.name, config.path))
-    inst = CameraServer.getInstance()
-    camera = UsbCamera(config.name, config.path)
-    server = inst.startAutomaticCapture(camera=camera, return_server=True)
-
-    camera.setConfigJson(json.dumps(config.config))
-    camera.setConnectionStrategy(VideoSource.ConnectionStrategy.kKeepOpen)
-
-    if config.streamConfig is not None:
-        server.setConfigJson(json.dumps(config.streamConfig))
-
-    return camera
-
-def startSwitchedCamera(config):
-    """Start running the switched camera."""
-    print("Starting switched camera '{}' on {}".format(config.name, config.key))
-    server = CameraServer.getInstance().addSwitchedCamera(config.name)
-
-    def listener(fromobj, key, value, isNew):
-        if isinstance(value, float):
-            i = int(value)
-            if i >= 0 and i < len(cameras):
-              server.setSource(cameras[i])
-        elif isinstance(value, str):
-            for i in range(len(cameraConfigs)):
-                if value == cameraConfigs[i].name:
-                    server.setSource(cameras[i])
-                    break
-
-    NetworkTablesInstance.getDefault().getEntry(config.key).addListener(
-        listener,
-        ntcore.constants.NT_NOTIFY_IMMEDIATE |
-        ntcore.constants.NT_NOTIFY_NEW |
-        ntcore.constants.NT_NOTIFY_UPDATE)
-
-    return server
-
 
 if __name__ == "__main__":
     if len(sys.argv) >= 2:
         configFile = sys.argv[1]
+
+    cond = threading.Condition()
+    notified = [False]
+
+    def connectionListener(connected, info):
+        print(info, '; Connected=%s' % connected)
+        with cond:
+            notified[0] = True
+            cond.notify()
 
     # read configuration
     if not readConfig():
@@ -230,45 +202,37 @@ if __name__ == "__main__":
     else:
         print("Setting up NetworkTables client for team {}".format(team))
         ntinst.startClientTeam(team)
-        # Replace with specific IP Address if not on roboRIO-like network
-        # ntinst.startClient("<IP ADDRESS>")
 
-    pipeline = rs.pipeline()
-    config = rs.config()
-    config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-    config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    NetworkTables.addConnectionListener(connectionListener, immediateNotify=True)
 
-    profile = pipeline.start(config)
+    with cond:
+        print("Waiting for network tables connection...")
+        if not notified[0]:
+            cond.wait()
 
-    device = profile.get_device()
-    print(f"Device: {device}")
-    # print(f"Device: {device.__dir__()}")
+    table = ntinst.getTable("datatable")
+    xEntry = table.getEntry("X")
+    yEntry = table.getEntry("Y")
 
-    try:
-        print("Getting OutputStream...")
-        colorOutputStream = CameraServer.getInstance().putVideo("Color Image", 640, 480)
-        depthOutputStream = CameraServer.getInstance().putVideo("Depth Image", 640, 480)
+    x_val = 0
+    y_val = 0
 
-        while True:
-            frames = pipeline.wait_for_frames()
-            depth_frame = frames.get_depth_frame()
-            color_frame = frames.get_color_frame()
+    # loop forever
+    while True:
+        xEntry.setNumber(x_val)
 
-            if not depth_frame or not color_frame:
-                print("No frames found!!!")
-                continue
+        x_val += 1
 
-            depth_image = np.asanyarray(depth_frame.get_data())
-            color_image = np.asanyarray(color_frame.get_data())
+        if x_val > 100:
+            x_val = 0
 
-            depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
+        yEntry.setNumber(y_val)
 
-            colorOutputStream.putFrame(color_image)
-            depthOutputStream.putFrame(depth_colormap)
+        y_val += 10
 
-    finally:
-        print("Calling pipeline stop")
-        pipeline.stop()
+        if y_val > 1000:
+            y_val = 0
 
-        # Sometimes the system won't come back up without a complete hardware reset.
-        device.hardware_reset()
+        print(f"X: {x_val}, Y: {y_val}")
+
+        time.sleep(1)
