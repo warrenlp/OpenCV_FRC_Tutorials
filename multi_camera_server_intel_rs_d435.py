@@ -244,6 +244,12 @@ if __name__ == "__main__":
     print(f"Device: {device}")
     # print(f"Device: {device.__dir__()}")
 
+    # Create an align object
+    # rs.align allows us to perform alignment of depth frames to others frames
+    # The "align_to" is the stream type to which we plan to align depth frames.
+    align_to = rs.stream.color
+    align = rs.align(align_to)
+
     try:
         print("Getting OutputStream...")
         colorOutputStream = CameraServer.getInstance().putVideo("Color Image", 640, 480)
@@ -251,8 +257,12 @@ if __name__ == "__main__":
 
         while True:
             frames = pipeline.wait_for_frames()
-            depth_frame = frames.get_depth_frame()
-            color_frame = frames.get_color_frame()
+
+            # Align the depth frame to color frame
+            aligned_frames = align.process(frames)
+
+            depth_frame = aligned_frames.get_depth_frame()
+            color_frame = aligned_frames.get_color_frame()
 
             if not depth_frame or not color_frame:
                 print("No frames found!!!")
